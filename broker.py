@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import datetime
 from typing import Optional, Tuple
 
 import MetaTrader5 as mt5
 
-import filters
+import config
 
-SYMBOL = "XAUUSDm"
+SYMBOL = config.CFG["SYMBOL"]
 MAGIC = 20251030
 
 # ---------------------------------------------------------------------------
@@ -27,6 +26,13 @@ def _norm(price: float, digits: int) -> float:
     return int(price * factor + 0.5) / factor
 
 
+def _snap_to_step(volume: float, step: float) -> float:
+    if step <= 0:
+        return float(volume)
+    steps = round(float(volume) / step)
+    return round(steps * step, 8)
+
+
 def _round_volume(vol: float, symbol: str) -> float:
     info = mt5.symbol_info(symbol)
     if info is None:
@@ -36,8 +42,8 @@ def _round_volume(vol: float, symbol: str) -> float:
     v_max = getattr(info, "volume_max", 1000.0) or 1000.0
     v_step = getattr(info, "volume_step", 0.01) or 0.01
     vol = max(v_min, min(v_max, vol))
-    steps = round(vol / v_step)
-    return round(steps * v_step, 8)
+    snapped = _snap_to_step(vol, v_step)
+    return max(v_min, min(v_max, snapped))
 
 
 def _ensure_symbol(symbol: str) -> bool:
@@ -53,6 +59,10 @@ def _tick(symbol: str):
     return mt5.symbol_info_tick(symbol)
 
 
+def get_tick(symbol: str = SYMBOL):
+    return _tick(symbol)
+
+
 def point_size(symbol: str):
     info = mt5.symbol_info(symbol)
     return info.point if info else None
@@ -61,6 +71,73 @@ def point_size(symbol: str):
 def symbol_digits(symbol: str):
     info = mt5.symbol_info(symbol)
     return info.digits if info else None
+
+
+def make_legal_sl_tp(
+    direction: str,
+    entry_price: float,
+    sl_price: Optional[float],
+    tp_price: Optional[float],
+    symbol: str = SYMBOL,
+) -> Tuple[Optional[float], Optional[float]]:
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        return sl_price, tp_price
+
+    digits = info.digits
+    point = info.point
+    stops = getattr(info, "trade_stops_level", 0) * point
+    freeze = getattr(info, "trade_freeze_level", 0) * point
+    bid = float(getattr(tick, "bid", 0.0))
+    ask = float(getattr(tick, "ask", 0.0))
+    buffer = point
+
+    def _norm_local(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        return _norm(value, digits)
+
+    if direction == "LONG":
+        if sl_price is not None:
+            min_sl = min(bid - stops - buffer, entry_price - buffer)
+            if freeze:
+                min_sl = min(min_sl, bid - freeze - buffer)
+            if sl_price > min_sl:
+                print(
+                    f"[SLTP] adjust SL LONG from {sl_price} to {min_sl} due to stops/freeze"
+                )
+                sl_price = min_sl
+        if tp_price is not None:
+            min_tp = max(ask + stops + buffer, entry_price + buffer)
+            if freeze:
+                min_tp = max(min_tp, ask + freeze + buffer)
+            if tp_price < min_tp:
+                print(
+                    f"[SLTP] adjust TP LONG from {tp_price} to {min_tp} due to stops/freeze"
+                )
+                tp_price = min_tp
+    else:
+        if sl_price is not None:
+            min_sl = max(ask + stops + buffer, entry_price + buffer)
+            if freeze:
+                min_sl = max(min_sl, ask + freeze + buffer)
+            if sl_price < min_sl:
+                print(
+                    f"[SLTP] adjust SL SHORT from {sl_price} to {min_sl} due to stops/freeze"
+                )
+                sl_price = min_sl
+        if tp_price is not None:
+            min_tp = min(bid - stops - buffer, entry_price - buffer)
+            if freeze:
+                min_tp = min(min_tp, bid - freeze - buffer)
+            if tp_price > min_tp:
+                print(
+                    f"[SLTP] adjust TP SHORT from {tp_price} to {min_tp} due to stops/freeze"
+                )
+                tp_price = min_tp
+
+    return _norm_local(sl_price), _norm_local(tp_price)
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +201,8 @@ def get_symbol_info(symbol: str) -> Optional[dict]:
         "digits": info.digits,
         "point": info.point,
         "trade_contract_size": getattr(info, "trade_contract_size", 1.0),
+        "trade_tick_value": getattr(info, "trade_tick_value", 0.0),
+        "trade_tick_size": getattr(info, "trade_tick_size", 0.0),
         "trade_stops_level": getattr(info, "trade_stops_level", 0),
         "trade_freeze_level": getattr(info, "trade_freeze_level", 0),
         "volume_min": getattr(info, "volume_min", 0.0),
@@ -188,102 +267,6 @@ def get_positions(symbol: str):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Stop/target calculations
-# ---------------------------------------------------------------------------
-
-def _atr_price_targets(
-    direction: str,
-    price: float,
-    lot: float,
-    symbol: str,
-    info,
-    sl: Optional[float],
-    tp: Optional[float],
-) -> Tuple[Optional[float], Optional[float]]:
-    if sl is not None and tp is not None:
-        return sl, tp
-
-    candles = get_ohlc(symbol, timeframe="M1", n=120)
-    atr_price = filters.compute_atr(candles, period=10)
-    contract_size = getattr(info, "trade_contract_size", 1.0)
-    atr_dollars = None
-    if atr_price is not None:
-        atr_dollars = atr_price * contract_size * lot
-
-    if atr_dollars is None:
-        # Fallback to modest static values
-        tp_dollars = 0.60
-        sl_dollars = 0.30
-    else:
-        tp_dollars = min(1.20, max(0.30, 0.35 * atr_dollars))
-        sl_dollars = min(0.60, max(0.15, 0.18 * atr_dollars))
-
-    if contract_size <= 0 or lot <= 0:
-        price_per_dollar = getattr(info, "point", 0.01)
-    else:
-        # For a position, pnl = price_diff * contract_size * lot
-        price_per_dollar = 1.0 / (contract_size * lot)
-
-    point = getattr(info, "point", 0.01)
-    digits = getattr(info, "digits", 2)
-
-    if sl is None:
-        sl_distance = sl_dollars * price_per_dollar
-        if direction == "LONG":
-            sl = _norm(price - sl_distance, digits)
-        else:
-            sl = _norm(price + sl_distance, digits)
-    if tp is None:
-        tp_distance = tp_dollars * price_per_dollar
-        if direction == "LONG":
-            tp = _norm(price + tp_distance, digits)
-        else:
-            tp = _norm(price - tp_distance, digits)
-    return sl, tp
-
-
-def _apply_distance_guards(
-    direction: str,
-    price: float,
-    sl: Optional[float],
-    tp: Optional[float],
-    info,
-    extra_points: int = 0,
-) -> Tuple[Optional[float], Optional[float]]:
-    if sl is None and tp is None:
-        return sl, tp
-
-    point = getattr(info, "point", 0.01)
-    digits = getattr(info, "digits", 2)
-    stops_level = getattr(info, "trade_stops_level", 0)
-    freeze_level = getattr(info, "trade_freeze_level", 0)
-
-    min_buffer_points = stops_level + 1 + extra_points
-    freeze_buffer_points = freeze_level + extra_points
-    min_buffer = max(min_buffer_points, freeze_buffer_points) * point
-
-    if direction == "LONG":
-        if sl is not None:
-            sl = min(price - min_buffer, sl)
-            sl = min(sl, price - point)
-            sl = _norm(sl, digits)
-        if tp is not None:
-            tp = max(price + min_buffer, tp)
-            tp = max(tp, price + point)
-            tp = _norm(tp, digits)
-    else:
-        if sl is not None:
-            sl = max(price + min_buffer, sl)
-            sl = max(sl, price + point)
-            sl = _norm(sl, digits)
-        if tp is not None:
-            tp = min(price - min_buffer, tp)
-            tp = min(tp, price - point)
-            tp = _norm(tp, digits)
-    return sl, tp
-
-
 def _resolve_position_ticket(preferred_ticket: int, symbol: str, lot: float, comment: str) -> Optional[int]:
     # Try direct lookup first
     if preferred_ticket:
@@ -312,64 +295,6 @@ def _send_deal(request: dict):
     return result
 
 
-def _ensure_sl_tp(ticket: int, sl: Optional[float], tp: Optional[float], info) -> None:
-    if ticket is None:
-        return
-    attempt = 0
-    while attempt < 2:
-        pos = mt5.positions_get(ticket=ticket)
-        if not pos:
-            return
-        pos = pos[0]
-        need_update = False
-        req_sl = sl
-        req_tp = tp
-        if req_sl and (pos.sl == 0 or abs(pos.sl - req_sl) > info.point * 1.5):
-            need_update = True
-        if req_tp and (pos.tp == 0 or abs(pos.tp - req_tp) > info.point * 1.5):
-            need_update = True
-        if not need_update:
-            return
-        request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "symbol": pos.symbol,
-            "position": ticket,
-            "sl": float(req_sl) if req_sl else 0.0,
-            "tp": float(req_tp) if req_tp else 0.0,
-            "magic": MAGIC,
-            "comment": "init-stops",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "deviation": 50,
-        }
-        res = mt5.order_send(request)
-        print(
-            f"[SLTP] attach retcode={getattr(res, 'retcode', None)} ticket={ticket} "
-            f"sl={req_sl} tp={req_tp}"
-        )
-        if res and res.retcode in {
-            mt5.TRADE_RETCODE_DONE,
-            getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
-            getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025),
-        }:
-            return
-        if res and res.retcode == mt5.TRADE_RETCODE_FROZEN:
-            print("[SLTP] FROZEN when attaching stops. Retrying after 3.5s")
-            time.sleep(3.5)
-        else:
-            # Soften distances slightly and retry once
-            sl_soft, tp_soft = _apply_distance_guards(
-                "LONG" if pos.type == mt5.POSITION_TYPE_BUY else "SHORT",
-                pos.price_open,
-                req_sl,
-                req_tp,
-                info,
-                extra_points=3,
-            )
-            request["sl"] = float(sl_soft) if sl_soft else 0.0
-            request["tp"] = float(tp_soft) if tp_soft else 0.0
-        attempt += 1
-
-
 # ---------------------------------------------------------------------------
 # Order operations
 # ---------------------------------------------------------------------------
@@ -379,32 +304,35 @@ def send_entry(
     lot: float,
     symbol: str = SYMBOL,
     comment: str = "ScalperEntry",
-    sl: Optional[float] = None,
-    tp: Optional[float] = None,
+    sl_price: Optional[float] = None,
+    tp_price: Optional[float] = None,
 ) -> Optional[int]:
     if direction not in {"LONG", "SHORT"}:
         raise ValueError("direction must be LONG or SHORT")
+    if sl_price is None or tp_price is None:
+        print("[ORDER] SL/TP must be provided for entry")
+        return None
 
     if not _ensure_symbol(symbol):
         print("[ORDER] symbol not ready")
         return None
 
     info = mt5.symbol_info(symbol)
-    tick = _tick(symbol)
-    if info is None or tick is None:
-        print("[ORDER] symbol info or tick unavailable")
+    if info is None:
+        print("[ORDER] symbol info unavailable")
         return None
 
-    price = float(tick.ask if direction == "LONG" else tick.bid)
     lot = _round_volume(lot, symbol)
 
-    sl, tp = _atr_price_targets(direction, price, lot, symbol, info, sl, tp)
-
     attempt = 0
-    extra_points = 0
-    ticket = None
+    ticket: Optional[int] = None
     while attempt < 3:
-        adj_sl, adj_tp = _apply_distance_guards(direction, price, sl, tp, info, extra_points=extra_points)
+        tick = _tick(symbol)
+        if tick is None:
+            print("[ORDER] tick unavailable during entry")
+            break
+        price = float(tick.ask if direction == "LONG" else tick.bid)
+        adj_sl, adj_tp = make_legal_sl_tp(direction, price, sl_price, tp_price, symbol)
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -425,9 +353,6 @@ def send_entry(
             f"[ORDER] action=OPEN dir={direction} lot={lot} price={price:.3f} "
             f"sl={adj_sl} tp={adj_tp} retcode={retcode}"
         )
-        if result is None:
-            print(f"[ORDER] send failed error={mt5.last_error()}")
-            break
         if result and retcode in {
             mt5.TRADE_RETCODE_DONE,
             getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
@@ -435,25 +360,23 @@ def send_entry(
             preferred_ticket = getattr(result, "order", 0) or getattr(result, "deal", 0)
             time.sleep(0.25)
             ticket = _resolve_position_ticket(preferred_ticket, symbol, lot, comment)
-            _ensure_sl_tp(ticket, adj_sl, adj_tp, info)
             return ticket
 
-        if retcode == mt5.TRADE_RETCODE_INVALID_STOPS:
-            extra_points += 3
-            print(
-                f"[ORDER] INVALID_STOPS enforcing buffer extra_points={extra_points} "
-                f"stops_level={getattr(info, 'trade_stops_level', 0)} freeze={getattr(info, 'trade_freeze_level', 0)}"
-            )
-            tick = _tick(symbol)
-            if tick:
-                price = float(tick.ask if direction == "LONG" else tick.bid)
+        if retcode == mt5.TRADE_RETCODE_REQUOTE:
             attempt += 1
             continue
-        if retcode == mt5.TRADE_RETCODE_REQUOTE:
-            tick = _tick(symbol)
-            if not tick:
-                break
-            price = float(tick.ask if direction == "LONG" else tick.bid)
+        if retcode == mt5.TRADE_RETCODE_INVALID_STOPS:
+            buffer = max(info.point, getattr(info, "trade_stops_level", 0) * info.point)
+            if direction == "LONG":
+                sl_price = (adj_sl or sl_price) - buffer
+                tp_price = (adj_tp or tp_price) + buffer
+            else:
+                sl_price = (adj_sl or sl_price) + buffer
+                tp_price = (adj_tp or tp_price) - buffer
+            print(
+                f"[ORDER] INVALID_STOPS adjust buffer={buffer} stops={getattr(info, 'trade_stops_level', 0)} "
+                f"freeze={getattr(info, 'trade_freeze_level', 0)}"
+            )
             attempt += 1
             continue
         if retcode == mt5.TRADE_RETCODE_FROZEN:
@@ -461,6 +384,8 @@ def send_entry(
             time.sleep(0.5)
             attempt += 1
             continue
+        if result is None:
+            print(f"[ORDER] send failed error={mt5.last_error()}")
         break
     return ticket
 
@@ -478,28 +403,49 @@ def modify_stop_to_breakeven(ticket: int, symbol: str = SYMBOL) -> bool:
         print("[SL] symbol info/tick unavailable")
         return False
 
-    point = info.point
-    digits = info.digits
-    stops_level = getattr(info, "trade_stops_level", 0)
-    freeze_level = getattr(info, "trade_freeze_level", 0)
-    buffer_points = stops_level + 1
-    price_open = pos.price_open
+    direction = "LONG" if pos.type == mt5.POSITION_TYPE_BUY else "SHORT"
+    entry_price = float(pos.price_open)
+    current_tp = float(pos.tp) if pos.tp else 0.0
+    target_sl = entry_price
 
-    if pos.type == mt5.POSITION_TYPE_BUY:
+    legal_sl, _ = make_legal_sl_tp(direction, entry_price, target_sl, current_tp or None, symbol)
+    if legal_sl is None:
+        print("[SL] unable to compute legal breakeven stop")
+        return False
+
+    point = info.point
+    freeze = getattr(info, "trade_freeze_level", 0) * point
+    stops = getattr(info, "trade_stops_level", 0) * point
+    min_distance = max(freeze, stops) + point
+
+    if direction == "LONG":
         market_ref = float(tick.bid)
-        target_sl = min(price_open, market_ref - (buffer_points * point))
+        if market_ref - legal_sl < min_distance:
+            print(
+                f"[SL] breakeven defer freeze-level distance={market_ref - legal_sl:.5f} "
+                f"min_required={min_distance:.5f}"
+            )
+            return False
+        if pos.sl and abs(float(pos.sl) - legal_sl) <= point * 0.5:
+            print(f"[SL] breakeven already set ticket={ticket}")
+            return True
     else:
         market_ref = float(tick.ask)
-        target_sl = max(price_open, market_ref + (buffer_points * point))
-
-    target_sl = _norm(target_sl, digits)
-    current_tp = float(pos.tp) if pos.tp else 0.0
+        if legal_sl - market_ref < min_distance:
+            print(
+                f"[SL] breakeven defer freeze-level distance={legal_sl - market_ref:.5f} "
+                f"min_required={min_distance:.5f}"
+            )
+            return False
+        if pos.sl and abs(float(pos.sl) - legal_sl) <= point * 0.5:
+            print(f"[SL] breakeven already set ticket={ticket}")
+            return True
 
     request = {
         "action": mt5.TRADE_ACTION_SLTP,
         "symbol": symbol,
         "position": ticket,
-        "sl": float(target_sl),
+        "sl": float(legal_sl),
         "tp": current_tp,
         "magic": MAGIC,
         "comment": "breakeven",
@@ -509,34 +455,100 @@ def modify_stop_to_breakeven(ticket: int, symbol: str = SYMBOL) -> bool:
 
     res = mt5.order_send(request)
     retcode = getattr(res, "retcode", None)
-    print(f"[SL] breakeven retcode={retcode} ticket={ticket} sl->{target_sl}")
+    print(f"[SL] breakeven retcode={retcode} ticket={ticket} sl->{legal_sl}")
     if res and retcode in {
         mt5.TRADE_RETCODE_DONE,
         getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
-        getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025),
     }:
         return True
-
-    if retcode == mt5.TRADE_RETCODE_FROZEN:
-        print("[SL] FROZEN near market. Re-queuing after 3.2s")
-        time.sleep(3.2)
-        res_retry = mt5.order_send(request)
-        retcode_retry = getattr(res_retry, "retcode", None)
-        print(f"[SL] retry retcode={retcode_retry} ticket={ticket}")
-        return bool(
-            res_retry
-            and retcode_retry
-            in {
-                mt5.TRADE_RETCODE_DONE,
-                getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
-                getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025),
-            }
-        )
-
+    if retcode in {
+        getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025),
+        mt5.TRADE_RETCODE_FROZEN,
+    }:
+        print(f"[SL] breakeven deferred retcode={retcode}")
+        return False
     if retcode == mt5.TRADE_RETCODE_INVALID_STOPS:
         print(
-            f"[SL] INVALID_STOPS when moving to BE. stops_level={stops_level} freeze={freeze_level}"
+            f"[SL] INVALID_STOPS when moving to BE. stops={stops/info.point if info.point else 0} "
+            f"freeze={freeze/info.point if info.point else 0}"
         )
+    return False
+
+
+def trail_stop(ticket: int, trail_price: float, symbol: str = SYMBOL) -> bool:
+    pos_list = mt5.positions_get(ticket=ticket)
+    if not pos_list:
+        print(f"[SL] trail position {ticket} not found")
+        return False
+
+    pos = pos_list[0]
+    info = mt5.symbol_info(symbol)
+    tick = _tick(symbol)
+    if info is None or tick is None:
+        print("[SL] trail symbol info/tick unavailable")
+        return False
+
+    direction = "LONG" if pos.type == mt5.POSITION_TYPE_BUY else "SHORT"
+    current_tp = float(pos.tp) if pos.tp else 0.0
+    current_sl = float(pos.sl) if pos.sl else None
+
+    if direction == "LONG" and current_sl is not None and trail_price <= current_sl:
+        return False
+    if direction == "SHORT" and current_sl is not None and trail_price >= current_sl:
+        return False
+
+    legal_sl, _ = make_legal_sl_tp(direction, float(pos.price_open), trail_price, current_tp or None, symbol)
+    if legal_sl is None:
+        print("[SL] unable to compute legal trail price")
+        return False
+
+    point = info.point
+    freeze = getattr(info, "trade_freeze_level", 0) * point
+    stops = getattr(info, "trade_stops_level", 0) * point
+    min_distance = max(freeze, stops) + point
+
+    if direction == "LONG":
+        market_ref = float(tick.bid)
+        if market_ref - legal_sl < min_distance:
+            print(
+                f"[SL] trail defer freeze-level distance={market_ref - legal_sl:.5f} "
+                f"min_required={min_distance:.5f}"
+            )
+            return False
+    else:
+        market_ref = float(tick.ask)
+        if legal_sl - market_ref < min_distance:
+            print(
+                f"[SL] trail defer freeze-level distance={legal_sl - market_ref:.5f} "
+                f"min_required={min_distance:.5f}"
+            )
+            return False
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": symbol,
+        "position": ticket,
+        "sl": float(legal_sl),
+        "tp": current_tp,
+        "magic": MAGIC,
+        "comment": "trail",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "deviation": 50,
+    }
+
+    res = mt5.order_send(request)
+    retcode = getattr(res, "retcode", None)
+    print(f"[SL] trail retcode={retcode} ticket={ticket} sl->{legal_sl}")
+    if res and retcode in {
+        mt5.TRADE_RETCODE_DONE,
+        getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
+    }:
+        return True
+    if retcode in {
+        getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025),
+        mt5.TRADE_RETCODE_FROZEN,
+    }:
+        print(f"[SL] trail deferred retcode={retcode}")
     return False
 
 
@@ -577,8 +589,14 @@ def close_position(ticket: int, symbol: str = SYMBOL) -> bool:
     return bool(res and retcode in {mt5.TRADE_RETCODE_DONE, getattr(mt5, "TRADE_RETCODE_PLACED", 10008)})
 
 
-def add_hedge(direction: str, lot: float, symbol: str = SYMBOL) -> Optional[int]:
-    return send_entry(direction, lot, symbol, comment="HEDGE")
+def add_hedge(
+    direction: str,
+    lot: float,
+    sl_price: float,
+    tp_price: float,
+    symbol: str = SYMBOL,
+) -> Optional[int]:
+    return send_entry(direction, lot, symbol, comment="HEDGE", sl_price=sl_price, tp_price=tp_price)
 
 
 def close_all(symbol: str = SYMBOL) -> None:
