@@ -1,40 +1,51 @@
 """risk.py
 
-Risk controls and basket management for the XAUUSDm scalper.
-The module purposefully avoids any broker dependencies so it remains
-unit-testable. Main orchestrator injects live data and acts on the returned
-signals.
+Risk sizing and management helpers for the XAUUSDm strategy.
 """
 from __future__ import annotations
 
 from typing import Literal, Optional
 
-# ---------------------------------------------------------------------------
-# Lot sizing
-# ---------------------------------------------------------------------------
-
-def base_lot(equity: float) -> float:
-    """Tiered lot sizing based on current equity."""
-    if equity <= 150:
-        return 0.01
-    if equity <= 400:
-        return 0.02
-    if equity <= 700:
-        return 0.03
-    return 0.05
+import MetaTrader5 as mt5
 
 
-# ---------------------------------------------------------------------------
-# Spread discipline
-# ---------------------------------------------------------------------------
+def _snap_to_step(volume: float, step: float) -> float:
+    if step <= 0:
+        return float(volume)
+    steps = round(float(volume) / step)
+    return round(steps * step, 8)
 
-def check_spread_ok(spread_points: int, limit_points: int) -> bool:
-    return spread_points <= limit_points
 
+def lots_for_risk(symbol: str, equity: float, risk_pct: float, stop_distance_price: float) -> float:
+    """Return lot size that risks ``risk_pct`` of equity for a stop distance."""
+    if equity <= 0 or risk_pct <= 0 or stop_distance_price <= 0:
+        return 0.0
 
-# ---------------------------------------------------------------------------
-# Daily guardrails
-# ---------------------------------------------------------------------------
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return 0.0
+
+    tick_value = getattr(info, "trade_tick_value", 0.0) or None
+    tick_size = getattr(info, "trade_tick_size", 0.0) or None
+    if tick_value and tick_size:
+        dollars_per_price = tick_value / tick_size
+    else:
+        dollars_per_price = getattr(info, "trade_contract_size", 1.0)
+
+    dollars_per_lot_at_stop = abs(stop_distance_price) * dollars_per_price
+    if dollars_per_lot_at_stop <= 1e-9:
+        return 0.0
+
+    account_risk = equity * risk_pct
+    raw_lots = account_risk / dollars_per_lot_at_stop
+
+    vol_min = getattr(info, "volume_min", 0.0) or 0.0
+    vol_max = getattr(info, "volume_max", 1000.0) or 1000.0
+    vol_step = getattr(info, "volume_step", 0.01) or 0.01
+
+    snapped = _snap_to_step(round(raw_lots, 2), vol_step)
+    return max(vol_min, min(vol_max, snapped))
+
 
 def daily_stop(
     equity: float,
@@ -55,71 +66,24 @@ def daily_stop(
     return "GO"
 
 
-# ---------------------------------------------------------------------------
-# Trade management
-# ---------------------------------------------------------------------------
-
 def manage_open_trade(
     pnl_dollars: float,
-    tp_target: float,
-    sl_cut: float,
-) -> Literal["HOLD", "TAKE_PROFIT", "BREAKEVEN_SL", "HEDGE_NOW"]:
-    """Return the management action for a live trade."""
-    if pnl_dollars >= tp_target:
-        return "TAKE_PROFIT"
-    breakeven_trigger = min(0.10, 0.33 * tp_target)
-    if pnl_dollars >= breakeven_trigger:
+    r_value_dollars: float,
+    be_trigger_r: float,
+    trail_after_r: float,
+) -> Literal["HOLD", "BREAKEVEN_SL", "TRAIL", "CUT_OR_HEDGE"]:
+    if r_value_dollars <= 1e-9:
+        return "HOLD"
+
+    r_multiple = pnl_dollars / r_value_dollars
+    if r_multiple >= trail_after_r:
+        return "TRAIL"
+    if r_multiple >= be_trigger_r:
         return "BREAKEVEN_SL"
-    if pnl_dollars <= -sl_cut:
-        return "HEDGE_NOW"
+    if r_multiple <= -1.0:
+        return "CUT_OR_HEDGE"
     return "HOLD"
 
 
-# ---------------------------------------------------------------------------
-# Hedge handling
-# ---------------------------------------------------------------------------
-
-def next_hedge_lot(base: float, hedge_layers: int) -> float:
-    """Scale hedge lot linearly with the number of layers already deployed."""
-    layer = hedge_layers + 1
-    return round(base * layer, 2)
-
-
-def hedge_controller(
-    hedge_layers: int,
-    max_layers: int = 2,
-) -> Literal["ADD", "LOCK"]:
-    return "ADD" if hedge_layers < max_layers else "LOCK"
-
-
-# ---------------------------------------------------------------------------
-# Basket protection
-# ---------------------------------------------------------------------------
-
-def basket_killswitch(
-    equity: float,
-    baseline_equity: Optional[float],
-    floating_pnl: float,
-    kill_pct: float = 12.0,
-) -> Literal["GO", "KILL"]:
-    if equity <= 0:
-        return "GO"
-    if floating_pnl <= -(kill_pct / 100.0) * equity:
-        return "KILL"
-    return "GO"
-
-
-# ---------------------------------------------------------------------------
-# Lock-mode logic
-# ---------------------------------------------------------------------------
-
-def lock_mode_controller(
-    total_pnl: float,
-    breakout_confirmed: bool,
-    threshold: float = 0.0,
-) -> Literal["CLOSE_ALL_AND_RESET", "TAKE_RECOVERY_TRADE", "WAIT"]:
-    if total_pnl >= threshold:
-        return "CLOSE_ALL_AND_RESET"
-    if breakout_confirmed:
-        return "TAKE_RECOVERY_TRADE"
-    return "WAIT"
+def max_trades_reached(trades_count: int, limit: int) -> bool:
+    return trades_count >= limit
