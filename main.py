@@ -1,290 +1,343 @@
-# main.py — Tournament bot controller (v3.4, orders enabled, 24×5)
-import time
-from datetime import datetime, timedelta
-from collections import deque
-from statistics import median
+"""main.py
 
+Main orchestrator for the XAUUSDm M1 scalper. Runs continuously (24×5) while
+respecting strict daily and basket risk guardrails.
+"""
+from __future__ import annotations
+
+import time
+from collections import deque
+from datetime import datetime, timedelta
+from statistics import median
+from typing import Optional
+
+import broker
 import filters
 import risk
-import broker
 
 SYMBOL = "XAUUSDm"
-
-# ---- run 24×5
-ALWAYS_ON_TRADING = True
-
-# ---- execute real orders
-EXECUTE_ORDERS = True
-
-PRESET = "BALANCED"
-PRESETS = {
-    "BALANCED": {
-        "ATR_WINDOW": 10, "MOMENTUM_FACTOR": 1.0,
-        "RANGE_LOOKBACK": 20,
-        "RANGE_MAX_WIDTH_PIPS": 250.0,
-        "SPREAD_LIMIT_POINTS_BASE": 190,        # your live prints ~160 pts
-        "DAILY_TARGET_PCT": 4, "MAX_DD_PCT": 6,
-        "TAKE_PROFIT_DOLLARS": 0.60, "STOP_LOSS_DOLLARS": 0.30,
-        "LOSS_TRIGGER_PIPS": 25,
-    },
-}
-
-CFG = PRESETS[PRESET]
-PIP_VALUE = 0.01
-MAX_HEDGE_LAYERS = 3
 ENTRY_COOLDOWN_SEC = 10
-SPREAD_SAMPLES = deque(maxlen=120)
+SPREAD_HISTORY = deque(maxlen=120)
 
 state = {
     "daily_start_equity": None,
+    "baseline_date": None,
     "hedge_layers": 0,
     "locked_mode": False,
     "locked_loss_value": 0.0,
-    "last_entry_ts": None
+    "lock_recovery_taken": False,
+    "last_entry_ts": None,
+    "sleep_seconds": 2.0,
 }
 
-def initialize_day():
-    acct = broker.get_account_info()
-    equity = acct["equity"]
-    state.update({
-        "daily_start_equity": equity,
-        "hedge_layers": 0,
-        "locked_mode": False,
-        "locked_loss_value": 0.0,
-        "last_entry_ts": None
-    })
-    print(f"[INIT] New session. Equity baseline = {equity:.2f} USD")
 
-def dynamic_spread_limit():
-    base = CFG["SPREAD_LIMIT_POINTS_BASE"]
-    if len(SPREAD_SAMPLES) < 30:
-        return base
-    cap = int(min(max(median(SPREAD_SAMPLES) * 2.3, base * 0.8), 240))
-    return cap
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def analyze_market():
-    candles = broker.get_ohlc(SYMBOL, timeframe="M1", n=120)
-    spread_points = broker.get_spread_points(SYMBOL)
-    SPREAD_SAMPLES.append(spread_points)
-    spread_cap = dynamic_spread_limit()
-
-    atr_val = filters.compute_atr(candles, period=CFG["ATR_WINDOW"])
-    in_session = True if ALWAYS_ON_TRADING else filters.session_ok(datetime.now())
-
-    m_state = filters.market_state(
-        candles, atr_val,
-        momentum_factor=CFG["MOMENTUM_FACTOR"],
-        range_lookback=CFG["RANGE_LOOKBACK"],
-        range_max_width_pips=CFG["RANGE_MAX_WIDTH_PIPS"],
-        pip_value=PIP_VALUE,
-        bias_lookback=20,
-        adx_period=10, adx_min=20,
-        ema_fast=13, ema_slow=34,
-        donchian_lkb=14
+def initialize_day() -> None:
+    account = broker.get_account_info()
+    equity = account["equity"]
+    today = datetime.now().date()
+    state.update(
+        {
+            "daily_start_equity": equity,
+            "baseline_date": today,
+            "hedge_layers": 0,
+            "locked_mode": False,
+            "locked_loss_value": 0.0,
+            "lock_recovery_taken": False,
+            "last_entry_ts": None,
+        }
     )
+    print(f"[INIT] baseline rolled to {today} with equity={equity:.2f} USD")
 
+
+def dynamic_spread_cap(default: int = 200) -> int:
+    if len(SPREAD_HISTORY) < 30:
+        return max(160, min(220, default))
+    med = median(SPREAD_HISTORY)
+    cap = int(med * 2.0)
+    return max(160, min(220, cap))
+
+
+def can_open_new_entry() -> bool:
+    last = state.get("last_entry_ts")
+    if last is None:
+        return True
+    return datetime.now() - last >= timedelta(seconds=ENTRY_COOLDOWN_SEC)
+
+
+def compute_targets_for_lot(
+    atr_price: Optional[float],
+    contract_size: Optional[float],
+    lot: float,
+) -> tuple:
+    if contract_size is None or contract_size <= 0 or lot <= 0:
+        return 0.60, 0.30
+    if atr_price is None:
+        atr_dollars = None
+    else:
+        atr_dollars = atr_price * contract_size * lot
+    if atr_dollars is None:
+        tp_dollars = 0.60
+        sl_dollars = 0.30
+    else:
+        tp_dollars = min(1.20, max(0.30, 0.35 * atr_dollars))
+        sl_dollars = min(0.60, max(0.15, 0.18 * atr_dollars))
+    return tp_dollars, sl_dollars
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+def analyze_market() -> dict:
+    candles = broker.get_ohlc(SYMBOL, timeframe="M1", n=160)
+    symbol_info = broker.get_symbol_info(SYMBOL) or {}
+    spread_points = broker.get_spread_points(SYMBOL)
+    SPREAD_HISTORY.append(spread_points)
+    spread_cap = dynamic_spread_cap()
+
+    atr_price = filters.compute_atr(candles, period=10)
+    adx_val = filters.compute_adx(candles, period=10)
+    regime = filters.market_state(candles, atr_price)
+    breakout_dir, donchian_hi, donchian_lo, last_close = filters.donchian_breakout(candles)
+    atr_dollars_one_lot = filters.atr_dollars(
+        candles, period=10, contract=symbol_info.get("trade_contract_size", 1.0)
+    )
     spread_ok = risk.check_spread_ok(spread_points, spread_cap)
-    point = broker.point_size(SYMBOL) or 0.0
-    digits = broker.symbol_digits(SYMBOL)
-    spread_usd = spread_points * point
 
     diag = filters.market_diag(candles, adx_period=10, ema_fast=13, ema_slow=34, donchian_lkb=14)
-    print(f"[DIAG] ADX={diag.get('adx'):.1f} | EMA13={diag.get('ema_fast'):.2f} / "
-          f"EMA34={diag.get('ema_slow'):.2f} | DCH(Hi/Lo)={diag.get('donchian_hi'):.2f}/"
-          f"{diag.get('donchian_lo'):.2f} | close={diag.get('last_close'):.2f}")
 
     return {
-        "market_state": m_state,
-        "in_session": in_session,
-        "spread_ok": spread_ok,
-        "spread_points": spread_points,
-        "spread_limit_used": spread_cap,
-        "spread_usd": spread_usd,
-        "digits": digits,
-        "atr": atr_val,
         "candles": candles,
-        "adx": diag.get("adx", 0.0)
+        "atr_price": atr_price,
+        "atr_dollars_one_lot": atr_dollars_one_lot,
+        "adx": adx_val,
+        "donchian_hi": donchian_hi,
+        "donchian_lo": donchian_lo,
+        "last_close": last_close,
+        "breakout_dir": breakout_dir,
+        "regime": regime,
+        "spread_points": spread_points,
+        "spread_cap": spread_cap,
+        "spread_ok": spread_ok,
+        "symbol_info": symbol_info,
+        "diag": diag,
     }
 
-def evaluate_account():
-    acct = broker.get_account_info()
-    equity = acct["equity"]
+
+def evaluate_account() -> dict:
+    account = broker.get_account_info()
     positions = broker.get_positions(SYMBOL)
-    basket_pnl = sum(pos["pnl_dollars"] for pos in positions)
-
-    stop_signal = risk.daily_stop(
-        equity, state["daily_start_equity"],
-        max_dd_pct=CFG["MAX_DD_PCT"], daily_target_pct=CFG["DAILY_TARGET_PCT"]
+    basket_pnl = sum(p["pnl_dollars"] for p in positions)
+    stop_signal = risk.daily_stop(account["equity"], state["daily_start_equity"])
+    kill_signal = risk.basket_killswitch(
+        equity=account["equity"],
+        baseline_equity=state["daily_start_equity"],
+        floating_pnl=basket_pnl,
     )
-    return {"equity": equity, "positions": positions, "basket_pnl": basket_pnl, "stop_signal": stop_signal}
+    return {
+        "balance": account["balance"],
+        "equity": account["equity"],
+        "positions": positions,
+        "basket_pnl": basket_pnl,
+        "stop_signal": stop_signal,
+        "kill_signal": kill_signal,
+    }
 
-def can_open_now():
-    if state["last_entry_ts"] is None:
-        return True
-    return (datetime.now() - state["last_entry_ts"]) >= timedelta(seconds=ENTRY_COOLDOWN_SEC)
 
-def base_lot_for_equity(equity):
-    return risk.base_lot(equity)
+# ---------------------------------------------------------------------------
+# Position management
+# ---------------------------------------------------------------------------
 
-# ATR-scaled targets in dollars (used by exit manager that closes via API)
-def dynamic_targets(atr_value):
-    if atr_value is None:
-        return CFG["TAKE_PROFIT_DOLLARS"], CFG["STOP_LOSS_DOLLARS"]
-    tp = max(0.30, round(0.35 * atr_value, 2))
-    sl = max(0.15, round(0.18 * atr_value, 2))
-    return tp, sl
+def act_on_positions(market: dict, account: dict) -> None:
+    candles = market["candles"]
+    atr_price = market["atr_price"]
+    contract_size = market["symbol_info"].get("trade_contract_size", 1.0)
+    positions = account["positions"]
+    basket_pnl = account["basket_pnl"]
+    stop_signal = account["stop_signal"]
+    kill_signal = account["kill_signal"]
+    regime = market["regime"]
 
-def act_on_positions(market_info, account_info):
-    global state
-    equity = account_info["equity"]
-    positions = account_info["positions"]
-    basket_pnl = account_info["basket_pnl"]
-    stop_signal = account_info["stop_signal"]
+    # Adjust polling cadence depending on lock state
+    state["sleep_seconds"] = 3.4 if state["locked_mode"] else 2.0
 
-    m_state   = market_info["market_state"]
-    spread_ok = market_info["spread_ok"]
-    in_session= market_info["in_session"]
-    atr_val   = market_info["atr"]
-    candles   = market_info["candles"]
-    adx_val   = market_info["adx"]
+    # Basket kill-switch
+    if kill_signal == "KILL":
+        print("[KILL] Floating loss breached -12%. Closing all and resetting.")
+        broker.close_all(SYMBOL)
+        state["hedge_layers"] = 0
+        state["locked_mode"] = False
+        state["locked_loss_value"] = 0.0
+        state["lock_recovery_taken"] = False
+        return
 
-    allow_new_entry = (stop_signal == "GO")
-
-    # ---------- LOCK MODE ----------
+    # Lock mode logic
     if state["locked_mode"]:
-        breakout_confirmed = (m_state in ("TREND_LONG", "TREND_SHORT"))
+        breakout_confirmed = regime in ("TREND_LONG", "TREND_SHORT")
         lock_action = risk.lock_mode_controller(
             total_pnl=basket_pnl,
-            locked_loss_value=state["locked_loss_value"],
-            breakout_confirmed=breakout_confirmed
+            breakout_confirmed=breakout_confirmed,
         )
         if lock_action == "CLOSE_ALL_AND_RESET":
-            print("[LOCK MODE] Basket recovered >= 0. Close ALL and reset.")
-            if EXECUTE_ORDERS:
-                broker.close_all(SYMBOL)
+            print("[LOCK] Basket recovered >=0. Closing all positions.")
+            broker.close_all(SYMBOL)
             state["hedge_layers"] = 0
             state["locked_mode"] = False
             state["locked_loss_value"] = 0.0
-            state["last_entry_ts"] = None
+            state["lock_recovery_taken"] = False
             return
-        elif lock_action == "TAKE_RECOVERY_TRADE":
-            if allow_new_entry and spread_ok and in_session and can_open_now():
-                lot = base_lot_for_equity(equity)
-                if m_state == "TREND_LONG":
-                    print(f"[RECOVERY] Long recovery entry lot={lot}")
-                    if EXECUTE_ORDERS: broker.send_entry("LONG", lot)
-                elif m_state == "TREND_SHORT":
-                    print(f"[RECOVERY] Short recovery entry lot={lot}")
-                    if EXECUTE_ORDERS: broker.send_entry("SHORT", lot)
+        if lock_action == "TAKE_RECOVERY_TRADE" and not state["lock_recovery_taken"]:
+            if stop_signal == "GO" and market["spread_ok"] and can_open_new_entry():
+                direction = "LONG" if regime == "TREND_LONG" else "SHORT"
+                lot = risk.base_lot(account["equity"])
+                print(f"[LOCK] Recovery trade {direction} lot={lot}")
+                broker.send_entry(direction, lot, comment="LOCK_RECOVERY")
                 state["last_entry_ts"] = datetime.now()
+                state["lock_recovery_taken"] = True
             else:
-                print("[RECOVERY] Breakout but gated.")
+                print("[LOCK] Breakout detected but gated by spread/daily stop/cooldown.")
         else:
-            print("[LOCK MODE] Waiting for breakout or recovery.")
+            print("[LOCK] Waiting for breakout recovery.")
         return
 
-    # ---------- MANAGE OPEN TRADES ----------
-    tp_dyn, sl_dyn = dynamic_targets(atr_val)
+    # Manage existing trades
     for pos in positions:
-        pnl_dollars = pos["pnl_dollars"]
-        decision = risk.manage_open_trade(
-            pnl_dollars,
-            tp_target=tp_dyn,
-            sl_cut=sl_dyn
-        )
-        if decision == "TAKE_PROFIT":
-            print(f"[TRADE {pos['ticket']}] TAKE_PROFIT at pnl ${pnl_dollars:.2f}")
-            if EXECUTE_ORDERS: broker.close_position(pos["ticket"])
-        elif decision == "BREAKEVEN_SL":
-            print(f"[TRADE {pos['ticket']}] Move SL to breakeven.")
-            if EXECUTE_ORDERS: broker.modify_stop_to_breakeven(pos["ticket"])
-        elif decision == "HEDGE_NOW":
-            hedge_action = risk.hedge_controller(state["hedge_layers"], MAX_HEDGE_LAYERS)
-            if hedge_action == "ADD_HEDGE":
-                new_lot = risk.next_hedge_lot(base_lot_for_equity(equity), state["hedge_layers"])
-                side = "SHORT" if pos["direction"] == "LONG" else "LONG"
-                print(f"[HEDGE] Add hedge layer {state['hedge_layers']+1} {side} lot={new_lot}")
-                if EXECUTE_ORDERS: broker.add_hedge(side, new_lot)
+        tp_target, sl_cut = compute_targets_for_lot(atr_price, contract_size, pos["lot"])
+        action = risk.manage_open_trade(pos["pnl_dollars"], tp_target, sl_cut)
+        if action == "TAKE_PROFIT":
+            print(f"[TRADE] ticket={pos['ticket']} TAKE_PROFIT pnl={pos['pnl_dollars']:.2f}")
+            broker.close_position(pos["ticket"])
+        elif action == "BREAKEVEN_SL":
+            print(f"[TRADE] ticket={pos['ticket']} move SL to breakeven")
+            broker.modify_stop_to_breakeven(pos["ticket"])
+        elif action == "HEDGE_NOW":
+            hedge_call = risk.hedge_controller(state["hedge_layers"])
+            if hedge_call == "ADD":
+                hedge_lot = risk.next_hedge_lot(risk.base_lot(account["equity"]), state["hedge_layers"])
+                hedge_dir = "SHORT" if pos["direction"] == "LONG" else "LONG"
+                print(
+                    f"[HEDGE] layer={state['hedge_layers']+1} direction={hedge_dir} lot={hedge_lot} "
+                    f"against ticket={pos['ticket']}"
+                )
+                broker.add_hedge(hedge_dir, hedge_lot)
                 state["hedge_layers"] += 1
             else:
-                print("[HEDGE] Max layers reached. Entering LOCK MODE.")
+                print("[HEDGE] Max hedge layers reached. Entering LOCK mode.")
                 state["locked_mode"] = True
                 state["locked_loss_value"] = basket_pnl
+                state["lock_recovery_taken"] = False
+                state["sleep_seconds"] = 3.4
+                return
 
-    if len(positions) > 0:
+    # Reset hedge counter when flat
+    if not positions:
+        if state["hedge_layers"] != 0:
+            print("[STATE] Basket flat. Resetting hedge layers.")
+        state["hedge_layers"] = 0
+        state["lock_recovery_taken"] = False
+
+    # No new trades allowed when there are open positions
+    if positions:
         return
 
-    # ---------- Range-reversion scalp (quarter size) ----------
-    if allow_new_entry and in_session and spread_ok and can_open_now() and atr_val is not None:
-        rr_dir = filters.range_reversion_signal(
-            candles, adx_period=10, adx_max=20,
-            bb_n=20, bb_k=2.0, rsi_n=14, rsi_low=40, rsi_high=60
+    if stop_signal not in ("GO", "BASELINE_UNKNOWN"):
+        print(f"[RISK] Daily stop active: {stop_signal}. No new entries.")
+        return
+
+    if not market["spread_ok"]:
+        print(
+            f"[SPREAD] Blocked. spread={market['spread_points']} cap={market['spread_cap']}"
         )
-        if rr_dir in ("LONG", "SHORT"):
-            lot = base_lot_for_equity(equity) * 0.25
-            print(f"[RR] {rr_dir} range-reversion lot={lot} | TP={tp_dyn} SL={sl_dyn}")
-            if EXECUTE_ORDERS: broker.send_entry(rr_dir, lot)
+        return
+
+    if not can_open_new_entry():
+        return
+
+    equity = account["equity"]
+    base_lot = risk.base_lot(equity)
+
+    # Trend entries
+    if regime in ("TREND_LONG", "TREND_SHORT"):
+        direction = "LONG" if regime == "TREND_LONG" else "SHORT"
+        print(f"[ENTRY] Trend {direction} lot={base_lot}")
+        broker.send_entry(direction, base_lot)
+        state["last_entry_ts"] = datetime.now()
+        return
+
+    # Micro breakout when regime unsure
+    if regime == "UNSURE":
+        micro_dir = filters.micro_breakout_signal(candles)
+        if micro_dir:
+            lot = round(base_lot * 0.5, 2)
+            print(f"[ENTRY] Micro-breakout {micro_dir} lot={lot}")
+            broker.send_entry(micro_dir, lot)
             state["last_entry_ts"] = datetime.now()
             return
 
-    # ---------- Micro-breakout (half → full by ADX) ----------
-    if allow_new_entry and in_session and spread_ok and can_open_now() and atr_val is not None:
-        micro_dir = filters.micro_signal(
-            candles=candles, atr_value=atr_val,
-            ema_fast=13, ema_slow=34, adx_period=10, adx_min_micro=14,
-            donchian_lkb=14, donchian_touch_k=0.50
-        )
-        if micro_dir in ("LONG", "SHORT") and (m_state == "UNSURE"):
-            lot_base = base_lot_for_equity(equity)
-            lot = lot_base * (1.0 if adx_val >= 40 else 0.5)
-            print(f"[MICRO] {micro_dir} scalp lot={lot} (ADX={adx_val:.1f}) | TP={tp_dyn} SL={sl_dyn}")
-            if EXECUTE_ORDERS: broker.send_entry(micro_dir, lot)
+    # Range reversion in calm conditions
+    if regime == "RANGING":
+        rr_dir = filters.range_reversion_signal(candles)
+        if rr_dir:
+            lot = round(base_lot * 0.25, 2)
+            print(f"[ENTRY] Range reversion {rr_dir} lot={lot}")
+            broker.send_entry(rr_dir, lot)
             state["last_entry_ts"] = datetime.now()
             return
 
-    # ---------- Primary trend entries ----------
-    if allow_new_entry and in_session and spread_ok and can_open_now():
-        entry_plan = risk.plan_new_entry(
-            market_state=m_state, spread_ok=spread_ok,
-            locked_mode=state["locked_mode"], hedge_layers=state["hedge_layers"]
-        )
-        if entry_plan in ("LONG", "SHORT"):
-            lot = base_lot_for_equity(equity)
-            print(f"[ENTRY] Opening {entry_plan} lot={lot} in {m_state} | TP={tp_dyn} SL={sl_dyn}")
-            if EXECUTE_ORDERS: broker.send_entry(entry_plan, lot)
-            state["last_entry_ts"] = datetime.now()
 
-def main_loop():
-    ok = broker.init_connection()
-    if not ok:
-        print("[FATAL] Could not connect broker.")
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main_loop() -> None:
+    if not broker.init_connection():
+        print("[FATAL] Unable to connect to MetaTrader 5")
         return
-    if state["daily_start_equity"] is None:
-        initialize_day()
+    initialize_day()
 
     while True:
         try:
-            market_info = analyze_market()
-            account_info = evaluate_account()
+            now = datetime.now()
+            if state["baseline_date"] != now.date() and now.weekday() <= 4:
+                initialize_day()
+
+            market = analyze_market()
+            account = evaluate_account()
 
             print("-----")
-            print(f"[TIME] {datetime.now().isoformat(timespec='seconds')}")
-            print(f"[STATE] market={market_info['market_state']}, "
-                  f"spread_ok={market_info['spread_ok']} "
-                  f"(now={market_info['spread_points']:.0f} pts, ~${market_info['spread_usd']:.3f}, "
-                  f"cap={market_info['spread_limit_used']} pts, digits={market_info['digits']}), "
-                  f"in_session={market_info['in_session']}")
-            atr_txt = f"{market_info['atr']:.3f}" if market_info['atr'] is not None else "n/a"
-            print(f"[EQUITY] {account_info['equity']:.2f} USD | basket PnL {account_info['basket_pnl']:.2f} USD | stop={account_info['stop_signal']}")
-            print(f"[FILTERS] ATR={atr_txt}  MOMO={CFG['MOMENTUM_FACTOR']}  "
-                  f"RANGE_LB={CFG['RANGE_LOOKBACK']}  RANGE_W={CFG['RANGE_MAX_WIDTH_PIPS']}")
-            print(f"[HEDGE] layers={state['hedge_layers']}  locked_mode={state['locked_mode']}  cooldown={ENTRY_COOLDOWN_SEC}s")
+            print(f"[TIME] {now.isoformat(timespec='seconds')}")
+            print(
+                f"[STATE] regime={market['regime']} spread_ok={market['spread_ok']} "
+                f"spread={market['spread_points']} cap={market['spread_cap']}"
+            )
+            print(
+                f"[EQUITY] equity={account['equity']:.2f} balance={account['balance']:.2f} "
+                f"basket={account['basket_pnl']:.2f} daily_stop={account['stop_signal']} "
+                f"kill={account['kill_signal']}"
+            )
+            atr_txt = "n/a" if market["atr_price"] is None else f"{market['atr_price']:.3f}"
+            adx_txt = "n/a" if market["adx"] is None else f"{market['adx']:.1f}"
+            print(
+                f"[FILTERS] ATR={atr_txt} ADX={adx_txt} "
+                f"DonchianHi={market['donchian_hi']} DonchianLo={market['donchian_lo']}"
+            )
+            print(
+                f"[HEDGE] layers={state['hedge_layers']} locked={state['locked_mode']} "
+                f"locked_loss={state['locked_loss_value']:.2f} cooldown={ENTRY_COOLDOWN_SEC}s"
+            )
 
-            act_on_positions(market_info, account_info)
-            time.sleep(2)
-        except Exception as e:
-            print(f"[ERROR] {e}")
-            time.sleep(2)
+            act_on_positions(market, account)
+
+            sleep_time = state.get("sleep_seconds", 2.0)
+            time.sleep(sleep_time)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[ERROR] {exc}")
+            time.sleep(2.5)
+
 
 if __name__ == "__main__":
     main_loop()
